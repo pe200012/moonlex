@@ -1,0 +1,749 @@
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
+
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeApplications #-}
+
+{-# LANGUAGE TypeFamilies #-}
+
+module Main ( main ) where
+
+import           Control.Applicative      ( Applicative(liftA2)
+                                          , asum )
+import           Control.Lens
+                 ( (%=)
+                 , (&)
+                 , (?=)
+                 , (??)
+                 , (?~)
+                 , (^.)
+                 , (^..)
+                 , (^?!)
+                 , (^?)
+                 , Lens'
+                 , _Just
+                 , altOf
+                 , anyOf
+                 , asumOf
+                 , at
+                 , each
+                 , foldOf
+                 , folded
+                 , ix
+                 , lens
+                 , makeLenses
+                 , to
+                 , use
+                 , zoom )
+import           Control.Monad            ( guard
+                                          , unless
+                                          , void
+                                          , when )
+import           Control.Monad.State      ( State
+                                          , execState
+                                          , runState )
+
+import           Data.Char
+                 ( GeneralCategory(DecimalNumber, LowercaseLetter, UppercaseLetter)
+                 , ord )
+import           Data.Foldable            ( fold
+                                          , for_ )
+import           Data.Functor             ( ($>) )
+import           Data.Functor.Foldable    ( cata )
+import           Data.Functor.Foldable.TH ( makeBaseFunctor )
+import           Data.HashMap.Lazy        ( HashMap )
+import qualified Data.HashMap.Lazy        as Map
+import           Data.Hashable            ( Hashable(hash) )
+import           Data.List                ( foldl'
+                                          , nub )
+import           Data.Maybe               ( fromMaybe
+                                          , isJust )
+import           Data.Set                 ( Set )
+import qualified Data.Set                 as Set
+import           Data.String.Interpolate  ( i )
+import           Data.Vector              ( Vector )
+import qualified Data.Vector              as Vector
+import           Data.Void                ( Void )
+import           Data.Word                ( Word8 )
+
+import           Development.Placeholders ( notImplemented )
+
+import           GHC.Generics             ( Generic )
+
+import           System.Environment       ( getArgs )
+
+import           Text.Megaparsec
+                 ( (<|>)
+                 , MonadParsec(eof, notFollowedBy, try)
+                 , Parsec
+                 , SourcePos
+                 , anySingle
+                 , between
+                 , choice
+                 , errorBundlePretty
+                 , getOffset
+                 , manyTill
+                 , oneOf
+                 , option
+                 , optional
+                 , runParser
+                 , sepBy1
+                 , some
+                 , takeRest )
+import           Text.Megaparsec.Char
+
+-- * Util functions
+type Map = HashMap
+
+-- | ANSI-C interpretation of escape char
+escapeChar :: Char -> Maybe Char
+escapeChar c = case c of
+  'a' -> Just '\a'
+  'b' -> Just '\b'
+  'f' -> Just '\f'
+  'n' -> Just '\n'
+  'r' -> Just '\r'
+  't' -> Just '\t'
+  'v' -> Just '\v'
+  _   -> Nothing
+
+-- * The definition of MoonLex grammar
+type MetaGrammarM = Parsec Void String
+
+data Pragma = MkPragma { directive :: String, argument :: String }
+    deriving ( Show
+             , Eq
+             , Ord )
+
+data Repeat = Exactly Int | FromTo Int (Maybe Int)
+    deriving ( Show
+             , Eq )
+
+data Regex
+    = Char Word8
+    | Concatenation [Regex]
+    | Choice [Regex]
+    | WordSet [Word8]
+    | Complement [Word8]
+    | ZeroOrMore Regex
+    | Option Regex
+    | Any
+    | Group Regex
+    | EndOfString
+    | EmptySet
+    | Epsilon
+    deriving ( Show
+             , Eq )
+
+makeBaseFunctor ''Regex
+
+concatenationR :: [Regex] -> Regex
+concatenationR [] = Epsilon
+concatenationR [ x ] = x
+concatenationR xs = case foldr phi [] xs of
+  []    -> Epsilon
+  [ x ] -> x
+  _     -> Concatenation xs
+  where
+    phi Epsilon acc = acc
+    phi EmptySet _ = [ EmptySet ]
+    phi _ [ EmptySet ] = [ EmptySet ]
+    phi r acc = r : acc
+
+choiceR :: [Regex] -> Regex
+choiceR [] = EmptySet
+choiceR [ x ] = x
+choiceR xs = case foldr phi [] xs of
+  []    -> EmptySet
+  [ x ] -> x
+  _     -> Choice xs
+  where
+    phi Epsilon _ = [ Epsilon ]
+    phi EmptySet acc = acc
+    phi _ [ Epsilon ] = [ Epsilon ]
+    phi r acc = r : acc
+
+wordSetR :: [Word8] -> Regex
+wordSetR [] = EmptySet
+wordSetR [ x ] = Char x
+wordSetR xs = WordSet (nub xs)
+
+complementR :: [Word8] -> Regex
+complementR [] = Any
+complementR xs = Complement (nub xs)
+
+repeatR :: Repeat -> Regex -> Regex
+repeatR (Exactly 0) _ = Epsilon
+repeatR (Exactly 1) r = r
+repeatR (Exactly n) r = Concatenation (replicate n r)
+repeatR (FromTo 0 Nothing) r = ZeroOrMore r
+repeatR (FromTo 1 Nothing) r = Concatenation [ r, ZeroOrMore r ]
+repeatR (FromTo n Nothing) r = Concatenation (replicate n r <> [ ZeroOrMore r ])
+repeatR (FromTo 0 (Just 0)) _ = Epsilon
+repeatR (FromTo 0 (Just 1)) r = Option r
+repeatR (FromTo 0 (Just n)) r = Concatenation (replicate n r)
+repeatR (FromTo n (Just m)) r =
+    Concatenation (replicate n r
+                   <> [ Option (Concatenation (replicate (m - n) r)) ])
+
+zeroOrMoreR :: Regex -> Regex
+zeroOrMoreR EmptySet = Epsilon
+zeroOrMoreR (Option r) = ZeroOrMore r
+zeroOrMoreR r = ZeroOrMore r
+
+oneOrMoreR :: Regex -> Regex
+oneOrMoreR EmptySet = EmptySet
+oneOrMoreR (Option r) = ZeroOrMore r
+oneOrMoreR r = Concatenation [ r, ZeroOrMore r ]
+
+optionR :: Regex -> Regex
+optionR EmptySet = Epsilon
+optionR Epsilon = Epsilon
+optionR (Option r) = Option r
+optionR r = Option r
+
+newtype Action = Action String
+    deriving ( Show )
+
+data Spec = Spec { rules    :: [([String], Regex, Action)]
+                 , userCode :: String
+                 , pragmas  :: [Pragma]
+                 }
+    deriving ( Show )
+
+newtype WithOffset a = WithOffset (a, Int, Int)
+    deriving ( Functor )
+
+_offsetValue :: Lens' (WithOffset a) a
+_offsetValue = lens (\(WithOffset (x, _, _)) -> x)
+                    (\(WithOffset (_, s, e)) x -> WithOffset (x, s, e))
+
+newtype WithPos a = WithPos (a, SourcePos, SourcePos)
+    deriving ( Functor
+             , Show
+             , Eq
+             , Ord )
+
+_posValue :: Lens' (WithPos a) a
+_posValue = lens (\(WithPos (x, _, _)) -> x)
+                 (\(WithPos (_, s, e)) x -> WithPos (x, s, e))
+
+lexeme :: MetaGrammarM a -> MetaGrammarM a
+lexeme p = p <* space
+
+offset :: MetaGrammarM a -> MetaGrammarM (WithOffset a)
+offset p = do
+  start <- getOffset
+  x <- p
+  end <- getOffset
+  pure $ WithOffset (x, start, end)
+
+metaChar :: MetaGrammarM Char
+metaChar = do
+  _ <- char '\\'
+  c <- anySingle
+  pure $ fromMaybe c (escapeChar c)
+
+singleChar :: MetaGrammarM Char
+singleChar = metaChar <|> anySingle
+
+comment_ :: MetaGrammarM ()
+comment_ = void comment
+
+comment :: MetaGrammarM String
+comment = do
+  s <- string "//"
+  (s <>) <$> manyTill anySingle (void eol <|> eof)
+
+plainChar :: MetaGrammarM Char
+plainChar = charCategory UppercaseLetter <|> charCategory LowercaseLetter
+    <|> charCategory DecimalNumber
+
+percentPercent :: MetaGrammarM ()
+percentPercent = void $ string "%%"
+
+parsePragma :: MetaGrammarM Pragma
+parsePragma = do
+  _ <- char '%'
+  notFollowedBy (char '%')
+  dct <- lexeme $ some plainChar
+  arg <- manyTill anySingle eol
+  pure $ MkPragma dct arg
+
+positiveSet :: MetaGrammarM Regex
+positiveSet = do
+  _ <- char '['
+  wordSetR <$> parseSetItems
+
+negativeSet :: MetaGrammarM Regex
+negativeSet = do
+  _ <- string "[^"
+  complementR <$> parseSetItems
+
+regexSet :: MetaGrammarM Regex
+regexSet = negativeSet <|> positiveSet
+
+groupRegex :: [(String, Regex)] -> MetaGrammarM Regex
+groupRegex = between (char '(') (char ')') . parseRegex
+
+dotAny :: MetaGrammarM Regex
+dotAny = char '.' $> Any
+
+eoi :: MetaGrammarM Regex
+eoi = char '$' $> EndOfString
+
+parseString :: MetaGrammarM String
+parseString = do
+  _ <- char '"'
+  manyTill singleChar (char '"')
+
+parseStartCondition :: MetaGrammarM [String]
+parseStartCondition =
+    between (char '<')
+            (char '>')
+            (sepBy1 (some (charCategory UppercaseLetter)) (char ','))
+
+quoted :: MetaGrammarM Regex
+quoted = concatenationR . fmap (Char . fromIntegral . ord) <$> parseString
+
+parseRepeat :: MetaGrammarM Repeat
+parseRepeat = do
+  _ <- lexeme (char '{')
+  a <- lexeme $ manyTill digitChar (oneOf @[] ",}")
+  option (Exactly (read a)) $ do
+    _ <- lexeme (char ',')
+    option (FromTo (read a) Nothing) $ FromTo (read a) . Just . read <$> phi
+  where
+    phi :: MetaGrammarM String
+    phi = (space >> char '}' $> "") <|> liftA2 (:) digitChar phi
+
+parseSetItem :: MetaGrammarM [Word8]
+parseSetItem = do
+  c0 <- singleChar
+  option (pure (fromIntegral (ord c0))) $ do
+    _ <- char '-'
+    c1 <- singleChar
+    pure [ fromIntegral (ord c0) .. fromIntegral (ord c1) ]
+
+parseSetItems :: MetaGrammarM [Word8]
+parseSetItems = (char ']' $> []) <|> liftA2 (<>) parseSetItem parseSetItems
+
+elementaryRegex :: [(String, Regex)] -> MetaGrammarM Regex
+elementaryRegex ctx = notFollowedBy ")"
+    >> (regexSet <|> groupRegex ctx <|> dotAny <|> eoi <|> quoted
+        <|> (do
+               name <- try namedPattern
+               case lookup name ctx of
+                 Nothing -> error $ "Unknown pattern: " <> name
+                 Just r  -> pure r)
+        <|> try (do
+                   c <- singleChar
+                   guard (c /= '|' && c /= '\n' && c /= '\r' && c /= ' ')
+                   pure $ Char (fromIntegral (ord c))))
+
+basicRegex :: [(String, Regex)] -> MetaGrammarM Regex
+basicRegex ctx = do
+  r <- elementaryRegex ctx
+  choice [ char '*' $> zeroOrMoreR r
+         , char '+' $> oneOrMoreR r
+         , char '?' $> optionR r
+         , liftA2 repeatR (try parseRepeat) (pure r)
+         , pure r
+         ]
+
+concatenation :: [(String, Regex)] -> MetaGrammarM Regex
+concatenation = fmap concatenationR . some . basicRegex
+
+parseRegex :: [(String, Regex)] -> MetaGrammarM Regex
+parseRegex ctx = do
+  reg <- sepBy1 (concatenation ctx) (char '|')
+  pure $ choiceR reg
+
+parseDefinition :: MetaGrammarM (String, Regex)
+parseDefinition = do
+  name <- lexeme $ some plainChar
+  space
+  def <- parseRegex []
+  pure (name, def)
+
+parseDefinitions :: MetaGrammarM ([(String, Regex)], [Pragma])
+parseDefinitions = phi [] []
+  where
+    phi defs prag = do
+      (lexeme comment_ >> phi defs prag)
+          <|> (try (lexeme parsePragma) >>= \p -> phi defs (p : prag))
+          <|> (try (lexeme parseDefinition) >>= \d -> phi (d : defs) prag)
+          <|> pure (reverse defs, reverse prag)
+
+namedPattern :: MetaGrammarM String
+namedPattern = do
+  _ <- char '{'
+  name <- some plainChar
+  _ <- char '}'
+  pure name
+
+parseCodeblock :: MetaGrammarM String
+parseCodeblock = phi 0
+  where
+    phi :: Int -> MetaGrammarM String
+    phi depth = (do
+                   e <- string "\\{" <|> string "\\}"
+                   ((e !! 1) :) <$> phi depth)
+        <|> (do
+               s <- parseString
+               (s <>) <$> phi depth)
+        <|> (do
+               c <- anySingle
+               if c == '{'
+                   then ('{' :) <$> phi (depth + 1)
+                   else if c == '}'
+                        then if depth == 0
+                             then pure "}"
+                             else ('}' :) <$> phi (depth - 1)
+                        else (c :) <$> phi depth)
+
+parseAction :: MetaGrammarM Action
+parseAction = Action <$> ((do
+                             _ <- char '{'
+                             ('{' :) <$> parseCodeblock)
+                          <|> manyTill anySingle (void eol <|> eof))
+
+parseRules :: [(String, Regex)] -> MetaGrammarM [([String], Regex, Action)]
+parseRules defs = some $ lexeme $ do
+  notFollowedBy "%%"
+  conds <- fold <$> optional parseStartCondition
+  pat <- parseRegex defs
+  space
+  action <- parseAction
+  pure (conds, pat, action)
+
+parseSpec :: MetaGrammarM Spec
+parseSpec = do
+  (def, prag) <- lexeme parseDefinitions
+  percentPercent
+  space
+  rs <- lexeme (parseRules def)
+  percentPercent
+  space
+  uc <- takeRest
+  pure $ Spec { rules = rs, userCode = uc, pragmas = prag }
+
+-- | NFA
+-- with int as state. Starts from state 0
+data NFA = NFA { transition :: Vector (Map Alphabet (Set Int))
+               , epsilonTransition :: Vector [Int]
+               , final :: Vector Bool
+               }
+    deriving ( Show )
+
+emptyNFA :: NFA
+emptyNFA =
+    NFA { transition = mempty, epsilonTransition = mempty, final = mempty }
+
+data Alphabet = Unicode Word8 | AnyChar
+    deriving ( Show
+             , Eq
+             , Generic
+             , Ord )
+
+instance Hashable Alphabet
+
+data NFANode = NFANode { outN        :: Map Alphabet [Int]
+                       , epsilonOutN :: [Int]
+                       , acceptedByN :: Maybe Int
+                       , comeFromN   :: [Int]
+                       }
+    deriving ( Show
+             , Ord
+             , Generic
+             , Eq )
+
+instance Hashable NFANode where
+  hash n = hash (comeFromN n, acceptedByN n)
+
+accept :: Int -> NFANode -> NFANode
+accept tag node = node { acceptedByN = Just tag }
+
+accepted :: Int -> NFANode
+accepted tag = NFANode { outN        = Map.empty
+                       , epsilonOutN = mempty
+                       , acceptedByN = Just tag
+                       , comeFromN   = mempty
+                       }
+
+rejected :: NFANode
+rejected = NFANode { outN        = Map.empty
+                   , epsilonOutN = mempty
+                   , acceptedByN = Nothing
+                   , comeFromN   = mempty
+                   }
+
+goFromN :: Int -> NFANode -> NFANode
+goFromN from node = node { comeFromN = from : comeFromN node }
+
+move :: NFANode -> Int -> NFANode
+move node next = node { epsilonOutN = next : epsilonOutN node }
+
+moveTo :: Int -> NFANode -> NFANode
+moveTo = flip move
+
+moveByN :: NFANode -> [Alphabet] -> Int -> NFANode
+moveByN node alphas next =
+    node { outN = foldl' (\acc a -> Map.insertWith (<>) a [ next ] acc)
+                         (outN node)
+                         alphas
+         }
+
+data AutomataContext node =
+    AutomataContext { _nodes :: Vector node, _hashes :: Map node Int }
+    deriving ( Show )
+
+makeLenses ''AutomataContext
+
+emptyContext :: AutomataContext a
+emptyContext = AutomataContext { _nodes = mempty, _hashes = Map.empty }
+
+type NFAConM = State (AutomataContext NFANode)
+
+spawnId :: a -> State (AutomataContext a) Int
+spawnId it = do
+  nodes %= flip Vector.snoc it
+  Vector.length <$> use nodes
+
+assign :: (Hashable a) => Int -> a -> State (AutomataContext a) ()
+assign i node = do
+  nodes %= (Vector.// [ (i, node) ])
+  hashes %= Map.insert node i
+
+spawnNode :: (Hashable a) => a -> State (AutomataContext a) Int
+spawnNode node = do
+  ctx <- use hashes
+  case Map.lookup node ctx of
+    Just idx -> pure idx
+    Nothing  -> do
+      slot <- use (nodes . to Vector.length)
+      nodes %= flip Vector.snoc node
+      hashes %= Map.insert node slot
+      pure slot
+
+unsafeLookup :: Int -> AutomataContext a -> a
+unsafeLookup i ctx = ctx ^. nodes . to (Vector.! i)
+
+unsafeLookupNode :: (Hashable a) => a -> AutomataContext a -> Int
+unsafeLookupNode node ctx = ctx ^. hashes . to (Map.! node)
+
+genNFA :: Int
+       -> AutomataContext NFANode
+       -> Regex
+       -> (Int, AutomataContext NFANode)
+genNFA tag ctx reg = runState ?? ctx $ do
+  end <- spawnNode (accepted tag)
+  cata go reg (moveTo end)
+  where
+    go :: RegexF ((NFANode -> NFANode) -> NFAConM Int)
+       -> (NFANode -> NFANode)
+       -> NFAConM Int
+    go (CharF w) k = do
+      end <- spawnNode (k rejected)
+      spawnNode (moveByN rejected [ Unicode w ] end)
+    go (ConcatenationF xs) k = phi xs
+      where
+        phi :: [(NFANode -> NFANode) -> NFAConM Int] -> NFAConM Int
+        phi [] = spawnNode (k rejected)
+        phi [ x ] = x k
+        phi (x : rest) = x . moveTo =<< phi rest
+    go (ChoiceF xs) k = spawnNode . foldl' move rejected =<< mapM ($ k) xs
+    go (WordSetF ws) k = do
+      end <- spawnNode (k rejected)
+      spawnNode (moveByN rejected (Unicode <$> ws) end)
+    go (ComplementF ws) k = do
+      end <- spawnNode (k rejected)
+      spawnNode (moveByN rejected
+                         (Unicode <$> filter (`notElem` ws) [ 0 .. 255 ])
+                         end)
+    go (ZeroOrMoreF r) k = do
+      end <- spawnNode (k rejected)
+      startId <- spawnId rejected
+      loop <- r (moveTo startId)
+      assign startId (rejected `move` loop `move` end)
+      pure startId
+    go (OptionF r) k = do
+      end <- spawnNode (k rejected)
+      spawnNode . (rejected `move` end `move`) =<< r id
+    go AnyF k = do
+      end <- spawnNode (k rejected)
+      spawnNode (moveByN rejected [ AnyChar ] end)
+    go (GroupF r) k = r k
+    go EndOfStringF _ = $notImplemented
+    go EmptySetF _ = spawnNode rejected
+    go EpsilonF k = spawnNode (k rejected)
+
+data DFANode = DFANode { outD :: Map Alphabet Int, acceptedByD :: Maybe Int }
+    deriving ( Show
+             , Ord
+             , Generic
+             , Eq )
+
+instance Hashable DFANode
+
+data DeterContext =
+    DeterContext { _deterContext :: AutomataContext (Set Int)
+                 , _deterEdges   :: Map (Set Int) (Map Alphabet (Set Int))
+                 , _deterFinal   :: Set (Set Int)
+                 }
+
+makeLenses ''DeterContext
+
+emptyDeterContext :: DeterContext
+emptyDeterContext = DeterContext { _deterContext = emptyContext
+                                 , _deterEdges   = mempty
+                                 , _deterFinal   = mempty
+                                 }
+
+type DFAConM = State (AutomataContext DFANode)
+
+type DeterM = State DeterContext
+
+moveByD :: Set Int -> Alphabet -> Set Int -> DeterM ()
+moveByD from alpha to = use (deterEdges . at from) >>= (deterEdges . at from ?=)
+    . maybe (Map.singleton alpha to) (Map.insert alpha to)
+
+genDFA :: Int -> AutomataContext NFANode -> (Int, AutomataContext DFANode)
+genDFA start ctx = ( unsafeLookupNode startingNode (settings ^. deterContext)
+                   , labeling settings
+                   )
+  where
+    settings = execState (walk startingNode) emptyDeterContext
+
+    eClosure :: Set Int -> NFANode -> Set Int
+    eClosure ac node =
+        foldl' (\acc target ->
+                if Set.member target acc
+                then acc
+                else eClosure (Set.insert target acc) (unsafeLookup target ctx))
+               ac
+               (epsilonOutN node)
+
+    closure :: Alphabet -> NFANode -> Set Int
+    closure ab node =
+        foldl' eClosure
+               mempty
+               (eClosure (Set.singleton (unsafeLookupNode node ctx)) node
+                ^.. folded
+                . to (\x -> foldMap (fmap (`unsafeLookup` ctx))
+                                    (outN (unsafeLookup x ctx) ^? ix ab))
+                . folded)
+
+    allAlphabet :: [Alphabet]
+    allAlphabet = ctx ^.. nodes . folded . to outN . to Map.keys . folded
+
+    walk :: Set Int -> DeterM ()
+    walk (ns :: Set Int) = do
+      _ <- zoom deterContext (spawnNode ns)
+      when (any (isJust . acceptedByN . flip unsafeLookup ctx) ns) $ do
+        deterFinal %= Set.insert ns
+      for_ allAlphabet $ \ab ->
+          let target = mconcat (ns ^.. folded . to (`unsafeLookup` ctx)
+                                . to (closure ab))
+          in
+              unless (Set.null target) $ do
+                moveByD ns ab target
+                zoom deterContext (use (hashes . at target)) >>= \case
+                  Nothing -> walk target
+                  Just _  -> pure ()
+
+    startingNode :: Set Int
+    startingNode = eClosure (Set.singleton start) (unsafeLookup start ctx)
+
+    labeling :: DeterContext -> AutomataContext DFANode
+    labeling res = AutomataContext { _nodes = v, _hashes = h }
+      where
+        v = Vector.fromList (res ^.. deterContext . nodes . folded
+                             . to (\s ->
+                                   DFANode { outD        =
+                                                 foldMap (fmap ((res ^. deterContext . hashes) Map.!))
+                                                         (res
+                                                          ^? deterEdges . ix s)
+                                           , acceptedByD =
+                                                 asum (s ^.. folded
+                                                       . to (`unsafeLookup` ctx)
+                                                       . to acceptedByN)
+                                           }))
+
+        h = Map.mapKeys (\s ->
+                         v Vector.! (res ^?! deterContext . hashes . ix s))
+                        (res ^. deterContext . hashes)
+
+type TransitionTable = Vector (Vector Int)
+
+newtype Machine = Machine { branches :: Vector (TransitionTable, Action) }
+
+foobar :: Spec -> AutomataContext DFANode
+foobar spec = undefined
+  where
+    go :: [([String], Regex, Action)] -> AutomataContext DFANode
+    go xs = undefined (foldr (\(i, x) ctx -> undefined)
+                             emptyContext
+                             (zip [ 0 .. ] xs))
+
+codeGen :: Spec -> String
+codeGen spec =
+    [i|
+// generated by moonlex
+
+let yyaccepted : Array[Int] = // TODO:
+let yytable : Array[Array[Int]] = // TODO:
+
+fn yylex() {
+    while(yyeof().not()) {
+      match yycond.val {
+        _ => (
+          fn loop(cur : Int) {
+            let next = yytable[yycond.val][yyinput()][cur]
+            if next == -1 then cur else loop(next)
+          }
+          match loop(yystart[yycond.val]) {
+             _ => () // TODO:
+          }
+        )
+      }
+    }
+}
+
+#{userCode spec}
+|]
+  where
+    labelToInt :: Hashable a => [a] -> Map a Int
+    labelToInt = foldr (\x acc -> case acc ^. at x of
+                          Nothing -> acc
+                              & at x ?~ Map.size acc
+                          Just _  -> acc)
+                       mempty
+
+    conds = labelToInt (concatMap (\(c, _, _) -> c) (rules spec))
+
+    machine = undefined spec
+
+main :: IO ()
+main = do
+  cliArgs <- getArgs
+  if length cliArgs /= 1
+      then putStrLn "Usage: moonlex <filename>"
+      else do
+        let filename = head cliArgs
+        putStrLn $ "Parsing " <> filename <> " ..."
+        content <- readFile filename
+        case runParser parseSpec filename content of
+          Left err   -> putStrLn (errorBundlePretty err)
+          Right spec -> do
+            print spec
+            putStrLn "Generating code ..."
+            putStrLn $ codeGen spec

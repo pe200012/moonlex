@@ -1,0 +1,75 @@
+name: moonlex
+version: 0.1.0.0
+github: "pe200012/moonlex"
+license: BSD-3-Clause
+author: "chenpeien"
+maintainer: "pe1326263755@gmail.com"
+copyright: "2023 pe200012"
+
+extra-source-files:
+  - README.md
+  - CHANGELOG.md
+
+# Metadata used when publishing your package
+# synopsis:            Short description of your package
+# category:            Web
+
+# To avoid duplicated efforts in documentation and dealing with the
+# complications of embedding Haddock markup inside cabal files, it is
+# common to point users to the README.md file.
+description: Please see the README on GitHub at <https://github.com/pe200012/moonlex#readme>
+
+dependencies:
+  - base >= 4.7 && < 5
+  - containers
+  - unordered-containers
+  - hashable
+  - megaparsec
+  - mtl
+  - lens
+  - bytestring
+  - template-haskell
+  - vector
+  - placeholders
+  - recursion-schemes
+  - string-interpolate
+  - text
+  - vector-algorithms
+  - monad-loops
+  - STMonadTrans
+
+ghc-options:
+  - -Wall
+  - -Wcompat
+  - -Widentities
+  - -Wincomplete-record-updates
+  - -Wincomplete-uni-patterns
+  - -Wmissing-export-lists
+  - -Wmissing-home-modules
+  - -Wpartial-fields
+  - -Wredundant-constraints
+
+library:
+  source-dirs: src
+
+executables:
+  moonlex-exe:
+    main: Main.hs
+    source-dirs: app
+    ghc-options:
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+    dependencies:
+      - moonlex
+
+tests:
+  moonlex-test:
+    main: Spec.hs
+    source-dirs: test
+    ghc-options:
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+    dependencies:
+      - moonlex
